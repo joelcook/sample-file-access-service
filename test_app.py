@@ -2,8 +2,9 @@ import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from app import create_app
 from fastapi.testclient import TestClient
+
+from app import create_app
 
 
 @pytest.fixture

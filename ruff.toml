@@ -1,0 +1,7 @@
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "I", "UP"]
+
+[lint.isort]
+known-first-party = ["app"]
