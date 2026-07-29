@@ -2,14 +2,38 @@
 
 from __future__ import annotations
 
+import os
 import secrets
+import sqlite3
 import time
-from threading import Lock
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlencode
 
 from fastapi import FastAPI, HTTPException, Response, status
 from pydantic import BaseModel, ConfigDict, Field
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS samples (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    sample_id TEXT NOT NULL REFERENCES samples(id),
+    qc_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (qc_status IN ('pending', 'passed', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS grants (
+    sample_id TEXT NOT NULL REFERENCES samples(id),
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (sample_id, user_id)
+);
+"""
 
 
 class Input(BaseModel):
@@ -35,22 +59,37 @@ class DownloadInput(Input):
 
 
 class Store:
-    """Process-local storage; the lock makes each decision/update atomic."""
+    """Small SQLite boundary; transactions and constraints enforce invariants."""
 
-    def __init__(self) -> None:
-        self.samples: dict[str, str] = {}  # sample_id -> owner_id
-        self.files: dict[str, dict[str, str]] = {}
-        self.grants: set[tuple[str, str]] = set()
-        self.lock = Lock()
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            db.executescript(SCHEMA)
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        db = sqlite3.connect(self.path, timeout=5)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield db
+        finally:
+            db.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self.connect() as db, db:
+            yield db
 
 
 def error(status_code: int, code: str) -> None:
     raise HTTPException(status_code=status_code, detail={"code": code})
 
 
-def create_app() -> FastAPI:
+def create_app(database_path: str | Path | None = None) -> FastAPI:
     app = FastAPI(title="Sample File Access Service")
-    store = Store()
+    store = Store(database_path or os.getenv("DATABASE_PATH", "sample-access.db"))
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -59,21 +98,21 @@ def create_app() -> FastAPI:
     @app.post("/samples", status_code=status.HTTP_201_CREATED)
     def register_sample(sample: SampleInput) -> dict:
         file_ids = [file.id for file in sample.files]
-        with store.lock:
-            conflicts = (
-                sample.id in store.samples
-                or len(file_ids) != len(set(file_ids))
-                or any(file_id in store.files for file_id in file_ids)
-            )
-            if conflicts:
-                error(status.HTTP_409_CONFLICT, "already_exists")
+        if len(file_ids) != len(set(file_ids)):
+            error(status.HTTP_409_CONFLICT, "already_exists")
 
-            store.samples[sample.id] = sample.owner_id
-            for file_id in file_ids:
-                store.files[file_id] = {
-                    "sample_id": sample.id,
-                    "qc_status": "pending",
-                }
+        try:
+            with store.transaction() as db:
+                db.execute(
+                    "INSERT INTO samples (id, owner_id) VALUES (?, ?)",
+                    (sample.id, sample.owner_id),
+                )
+                db.executemany(
+                    "INSERT INTO files (id, sample_id) VALUES (?, ?)",
+                    ((file_id, sample.id) for file_id in file_ids),
+                )
+        except sqlite3.IntegrityError:
+            error(status.HTTP_409_CONFLICT, "already_exists")
 
         return {
             "id": sample.id,
@@ -86,46 +125,70 @@ def create_app() -> FastAPI:
         status_code=status.HTTP_204_NO_CONTENT,
     )
     def grant_access(sample_id: str, user_id: str) -> Response:
-        with store.lock:
-            if sample_id not in store.samples:
+        with store.transaction() as db:
+            sample = db.execute(
+                "SELECT 1 FROM samples WHERE id = ?", (sample_id,)
+            ).fetchone()
+            if sample is None:
                 error(status.HTTP_404_NOT_FOUND, "no_such_sample")
-            store.grants.add((sample_id, user_id))
+            db.execute(
+                "INSERT OR IGNORE INTO grants (sample_id, user_id) VALUES (?, ?)",
+                (sample_id, user_id),
+            )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @app.post("/files/{file_id}/qc")
     def update_qc(file_id: str, update: QCInput) -> dict[str, str]:
-        with store.lock:
-            file = store.files.get(file_id)
+        with store.transaction() as db:
+            changed = db.execute(
+                """
+                UPDATE files SET qc_status = ?
+                WHERE id = ? AND qc_status = 'pending'
+                """,
+                (update.status, file_id),
+            )
+            if changed.rowcount == 1:
+                return {"file_id": file_id, "qc_status": update.status}
+
+            file = db.execute(
+                "SELECT qc_status FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
             if file is None:
                 error(status.HTTP_404_NOT_FOUND, "no_such_file")
-
-            current = file["qc_status"]
-            if current == "pending":
-                file["qc_status"] = update.status
-            elif current != update.status:
+            if file["qc_status"] != update.status:
                 error(status.HTTP_409_CONFLICT, "invalid_qc_transition")
 
         return {"file_id": file_id, "qc_status": update.status}
 
     @app.post("/files/{file_id}/download-requests")
     def request_download(file_id: str, request: DownloadInput) -> dict:
-        with store.lock:
-            file = store.files.get(file_id)
-            if file is None:
-                error(status.HTTP_404_NOT_FOUND, "no_such_file")
+        with store.connect() as db:
+            file = db.execute(
+                """
+                SELECT
+                    files.qc_status,
+                    samples.owner_id,
+                    EXISTS (
+                        SELECT 1 FROM grants
+                        WHERE grants.sample_id = samples.id
+                          AND grants.user_id = ?
+                    ) AS has_grant
+                FROM files
+                JOIN samples ON samples.id = files.sample_id
+                WHERE files.id = ?
+                """,
+                (request.user_id, file_id),
+            ).fetchone()
 
-            sample_id = file["sample_id"]
-            is_owner = store.samples[sample_id] == request.user_id
-            has_grant = (sample_id, request.user_id) in store.grants
-            if not (is_owner or has_grant):
-                # Do not reveal QC state to a caller without sample access.
-                error(status.HTTP_403_FORBIDDEN, "no_access")
-
-            qc_status = file["qc_status"]
-            if qc_status == "pending":
-                error(status.HTTP_409_CONFLICT, "qc_pending")
-            if qc_status == "failed":
-                error(status.HTTP_409_CONFLICT, "qc_failed")
+        if file is None:
+            error(status.HTTP_404_NOT_FOUND, "no_such_file")
+        if file["owner_id"] != request.user_id and not file["has_grant"]:
+            # Do not reveal QC state to a caller without sample access.
+            error(status.HTTP_403_FORBIDDEN, "no_access")
+        if file["qc_status"] == "pending":
+            error(status.HTTP_409_CONFLICT, "qc_pending")
+        if file["qc_status"] == "failed":
+            error(status.HTTP_409_CONFLICT, "qc_failed")
 
         expires_at = int(time.time()) + 300
         query = urlencode(

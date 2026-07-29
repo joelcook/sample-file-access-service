@@ -14,6 +14,9 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
+Data is stored in `sample-access.db` by default. Set `DATABASE_PATH` to use a
+different location.
+
 API documentation is at <http://127.0.0.1:8000/docs>. Run the checks with:
 
 ```bash
@@ -46,9 +49,11 @@ The QC and download bodies are `{"status": "passed"}` and
 
 ## Choices
 
-I chose in-memory storage because the brief permits it and it keeps this
-time-boxed service focused on the access rules. A lock makes each registration,
-grant, QC update, and download decision atomic within one process.
+I chose SQLite because QC callbacks are asynchronous and access state should
+survive a process restart. It is still a zero-infrastructure option, while
+transactions make registration and QC changes atomic. Primary keys, foreign
+keys, and a `CHECK` constraint enforce the important data invariants. I used
+direct `sqlite3` calls rather than adding an ORM for three small tables.
 
 Owners have implicit access; other users need a grant. Access is checked before
 QC so unauthorized users do not learn a file's QC result. QC may move only from
@@ -67,15 +72,16 @@ caller able to reach the QC endpoint. A sample may have no files.
 
 ## Alternatives and known weaknesses
 
-SQLite would preserve data across restarts and coordinate multiple workers, but
-adds persistence code that is not needed to demonstrate these rules. PostgreSQL,
-an ORM, migrations, and real Azure Blob SAS URLs would be appropriate later but
-are outside this exercise.
+In-memory dictionaries would be shorter, but lose grants and QC results on every
+restart. PostgreSQL would be a better fit for a horizontally scaled production
+service, but its deployment and migration setup are unnecessary for this
+exercise.
 
-The current store is lost on restart and cannot be shared across processes. The
-fake URL is not cryptographically verifiable, and the service has no
-authentication, audit log, rate limiting, or production observability.
+SQLite still assumes a single service deployment with a shared local database
+file. The fake URL is not cryptographically verifiable, and the service has no
+authentication, audit log, rate limiting, schema migration tooling, or
+production observability.
 
-With more time I would add durable storage and migrations, identity integration,
-signed/authenticated QC callbacks, Azure SAS generation, structured audit
-events, metrics, and integration tests.
+With more time I would move to the production database, add migrations and
+identity integration, authenticate QC callbacks, generate Azure Blob SAS URLs,
+and add structured audit events, metrics, and integration tests.
